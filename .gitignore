@@ -1,0 +1,21 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Data, training runs, and model artifacts
+raw/
+packed/
+data/
+datasets/
+runs/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Local editor files
+.idea/
+.vscode/
