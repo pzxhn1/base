@@ -48,7 +48,8 @@ raw/DroneVehicle/
 
 RGB 只用 `*img` 和 `*label`，不把 `*imgr`、`*labelr` 当作 RGB 数据。
 原始图像为 840×712，四周各有 100 像素白边；转换脚本会裁为 640×512。
-转换包含 RGB XML 中所有有效的五类旋转框；原版 Ultralytics OBB 不提供
+转换包含 RGB XML 中所有有效的五类旋转框和水平框；水平框按轴对齐 OBB 处理。
+只有点坐标的对象无法构成检测框，按数量记录并跳过。原版 Ultralytics OBB 不提供
 DroneVehicle `difficult` 区域的专门评估规则。请保留 train、val、test 的官方划分，
 不重新混合。
 
@@ -63,8 +64,10 @@ DroneVehicle `difficult` 区域的专门评估规则。请保留 train、val、t
 Ultralytics 的九列归一化 OBB 标签，输出 `data\dronevehicle_rgb\data.yaml`、
 `manifest.json` 和随机抽取的 20 张 `previews`。打开预览图，逐一确认绿色
 旋转框落在车辆上，特别检查靠近裁边的车辆。类别编号固定为
-`car, freight_car, truck, bus, van`。未知类别、错配和退化框会使脚本报错；
-裁切区域外的框单独计数在 `manifest.json`。不要带着错误开始训练。
+`car, freight_car, truck, bus, van`。已核实的 `feright`、`truvk` 笔误分别归入
+`freight_car`、`truck`；唯一无法判定的 `*` 类别、点标注和退化框单独计数并跳过。
+其他未知类别及图像配对错误会中止转换。`manifest.json` 按划分记录各类标注格式、
+保留数量、类别修正与跳过原因。不要带着未解释的异常开始训练。
 
 ### 4. GPU 短跑与完整训练
 
@@ -79,6 +82,8 @@ Ultralytics 的九列归一化 OBB 标签，输出 `data\dronevehicle_rgb\data.y
 `--batch 4 --name seed42_batch4` 重新运行，并在论文中记录实际 batch。
 训练输出位于 `runs\rgb_obb\seed42`，包括 `args.yaml`、`results.csv`、
 曲线和 `weights\best.pt`。若某次运行目录已存在，换一个 `--name`，避免覆盖。
+如训练中断，可用 `--resume runs\rgb_obb\seed42\weights\last.pt` 续训；
+续训保留检查点中的轮次和训练设置。
 
 ### 5. 独立测试
 

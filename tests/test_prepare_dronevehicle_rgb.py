@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import yaml
 
-from prepare_dronevehicle_rgb import OUTPUT_SIZE, clipped_obb, prepare
+from prepare_dronevehicle_rgb import OUTPUT_SIZE, clipped_obb, convert_xml, prepare
 
 
 def write_sample(root: Path, split: str, stem: str, *, with_xml: bool = True,
@@ -69,6 +69,27 @@ class PrepareDroneVehicleRGBTests(unittest.TestCase):
         self.assertTrue(((box >= 0) & (box <= 1)).all())
         self.assertAlmostEqual(float(box[:, 0].min()), 0, places=6)
         self.assertAlmostEqual(float(box[:, 0].max()), 30 / 640, places=6)
+
+    def test_mixed_geometry_and_known_annotation_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            xml = Path(directory) / "mixed.xml"
+            xml.write_text("""<annotation><size><width>840</width><height>712</height></size>
+<object><name>car</name><bndbox><xmin>120</xmin><ymin>130</ymin><xmax>180</xmax><ymax>160</ymax></bndbox></object>
+<object><name>car</name><point><x>200</x><y>200</y></point></object>
+<object><name>feright</name><polygon><x1>120</x1><y1>130</y1><x2>180</x2><y2>130</y2><x3>180</x3><y3>160</y3><x4>120</x4><y4>160</y4></polygon></object>
+<object><name>truvk</name><polygon><x1>120</x1><y1>130</y1><x2>180</x2><y2>130</y2><x3>180</x3><y3>160</y3><x4>120</x4><y4>160</y4></polygon></object>
+<object><name>*</name><polygon><x1>120</x1><y1>130</y1><x2>180</x2><y2>130</y2><x3>180</x3><y3>160</y3><x4>120</x4><y4>160</y4></polygon></object>
+<object><name>car</name><bndbox><xmin>120</xmin><ymin>130</ymin><xmax>120</xmax><ymax>160</ymax></bndbox></object>
+</annotation>""", encoding="utf-8")
+            lines, audit = convert_xml(xml)
+            self.assertEqual(len(lines), 3)
+            self.assertEqual([line.split()[0] for line in lines], ["0", "1", "2"])
+            self.assertEqual(audit["retained_by_class_and_format"]["car"]["hbb"], 1)
+            self.assertEqual(audit["skipped_by_class_and_reason"]["car"]["point_only"], 1)
+            self.assertEqual(audit["skipped_by_class_and_reason"]["car"]["degenerate"], 1)
+            self.assertEqual(audit["corrected_class_names"]["feright"], 1)
+            self.assertEqual(audit["corrected_class_names"]["truvk"], 1)
+            self.assertEqual(audit["skipped_unresolved_names"]["*"], 1)
 
 
 if __name__ == "__main__":

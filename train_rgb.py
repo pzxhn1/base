@@ -21,6 +21,8 @@ def main() -> None:
                         help="Fraction of training images; values below 1 are for a GPU probe")
     parser.add_argument("--project", default="runs/rgb_obb")
     parser.add_argument("--name", default="seed42")
+    parser.add_argument("--resume", type=Path,
+                        help="Continue an interrupted run from its weights/last.pt checkpoint")
     args = parser.parse_args()
 
     data = args.data.resolve()
@@ -29,7 +31,7 @@ def main() -> None:
     if not 0 < args.fraction <= 1:
         parser.error("--fraction must be in (0, 1]")
     project = Path(args.project).resolve()
-    if (project / args.name).exists():
+    if not args.resume and (project / args.name).exists():
         parser.error(f"Run directory already exists: {project / args.name}; choose another --name")
     if args.device != "cpu":
         if not torch.cuda.is_available():
@@ -45,6 +47,14 @@ def main() -> None:
         if result != 1.0:
             parser.error("GPU kernel check returned an unexpected value")
         print(f"GPU ready: {torch.cuda.get_device_name(0)}; torch={torch.__version__}")
+
+    if args.resume:
+        checkpoint = args.resume.resolve()
+        if not checkpoint.is_file():
+            parser.error(f"Resume checkpoint does not exist: {checkpoint}")
+        model = YOLO(str(checkpoint), task="obb")
+        model.train(resume=str(checkpoint), data=str(data), device=args.device)
+        return
 
     model = YOLO(args.model, task="obb")
     model.train(

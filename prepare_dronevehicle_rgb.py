@@ -29,10 +29,12 @@ OUTPUT_SIZE = (640, 512)
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
-def class_id(raw_name: str, xml_path: Path) -> int:
+def class_id(raw_name: str, xml_path: Path) -> int | None:
+    if raw_name.strip() == "*":
+        return None  # One genuinely ambiguous training label in the official release.
     key = "".join(ch for ch in raw_name.casefold() if ch.isalnum())
     aliases = {"car": 0, "freightcar": 1, "ferightcar": 1,
-               "truck": 2, "bus": 3, "van": 4}
+               "feright": 1, "truck": 2, "truvk": 2, "bus": 3, "van": 4}
     if key not in aliases:
         raise ValueError(f"Unknown class {raw_name!r} in {xml_path}")
     return aliases[key]
@@ -66,12 +68,14 @@ def source_files(source: Path, split: str) -> tuple[dict[str, Path], dict[str, P
     return images, labels
 
 
-def xml_points(obj: ET.Element, path: Path) -> np.ndarray:
+def xml_points(obj: ET.Element, path: Path) -> tuple[np.ndarray | None, str]:
     box = obj.find("polygon")
     if box is None:
         box = obj.find("bndbox")
     if box is None:
-        raise ValueError(f"Missing <polygon> or <bndbox> in {path}")
+        if obj.find("point") is not None:
+            return None, "point"
+        raise ValueError(f"Unknown annotation geometry in {path}")
     # DroneVehicle uses four corner points. Accept either 1..4 or 0..3 tags.
     for indices in ((1, 2, 3, 4), (0, 1, 2, 3)):
         if all(box.findtext(f"x{i}") is not None and box.findtext(f"y{i}") is not None for i in indices):
@@ -84,8 +88,20 @@ def xml_points(obj: ET.Element, path: Path) -> np.ndarray:
                 raise ValueError(f"Non-numeric OBB coordinate in {path}") from exc
             if not np.isfinite(points).all():
                 raise ValueError(f"Non-finite OBB coordinate in {path}")
-            return points
-    raise ValueError(f"Expected four OBB corner pairs in {path}")
+            return points, "polygon"
+    if box.tag == "bndbox":
+        keys = ("xmin", "ymin", "xmax", "ymax")
+        if all(box.findtext(key) is not None for key in keys):
+            try:
+                xmin, ymin, xmax, ymax = (float(box.findtext(key)) for key in keys)
+            except ValueError as exc:
+                raise ValueError(f"Non-numeric HBB coordinate in {path}") from exc
+            if not np.isfinite([xmin, ymin, xmax, ymax]).all():
+                raise ValueError(f"Non-finite HBB coordinate in {path}")
+            points = np.array([[xmin, ymin], [xmax, ymin],
+                               [xmax, ymax], [xmin, ymax]], dtype=np.float32)
+            return points, "hbb"
+    raise ValueError(f"Expected four OBB corners or HBB bounds in {path}")
 
 
 def clipped_obb(points: np.ndarray) -> np.ndarray | None:
@@ -106,7 +122,32 @@ def clipped_obb(points: np.ndarray) -> np.ndarray | None:
     return rectangle / np.array([width, height], dtype=np.float32)
 
 
-def convert_xml(path: Path) -> tuple[list[str], Counter, int]:
+def empty_audit() -> dict:
+    return {
+        "source_by_format": Counter(),
+        "source_by_class_and_format": {name: Counter() for name in CLASSES},
+        "retained_by_class": Counter(),
+        "retained_by_class_and_format": {name: Counter() for name in CLASSES},
+        "skipped_by_class_and_reason": {name: Counter() for name in CLASSES},
+        "corrected_class_names": Counter(),
+        "skipped_unresolved_names": Counter(),
+        "examples": {},
+    }
+
+
+def merge_audit(total: dict, part: dict) -> None:
+    for key in ("source_by_format", "retained_by_class", "corrected_class_names",
+                "skipped_unresolved_names"):
+        total[key].update(part[key])
+    for key in ("source_by_class_and_format", "retained_by_class_and_format",
+                "skipped_by_class_and_reason"):
+        for name in CLASSES:
+            total[key][name].update(part[key][name])
+    for key, value in part["examples"].items():
+        total["examples"].setdefault(key, value)
+
+
+def convert_xml(path: Path) -> tuple[list[str], dict]:
     try:
         root = ET.parse(path).getroot()
     except ET.ParseError as exc:
@@ -120,24 +161,52 @@ def convert_xml(path: Path) -> tuple[list[str], Counter, int]:
         if declared != SOURCE_SIZE:
             raise ValueError(f"Unexpected XML size {declared} in {path}; expected {SOURCE_SIZE}")
     lines: list[str] = []
-    counts: Counter = Counter()
-    outside = 0
-    for obj in root.findall("object"):
+    audit = empty_audit()
+    for object_index, obj in enumerate(root.findall("object")):
         name = obj.findtext("name")
         if not name:
             raise ValueError(f"Object without a class name in {path}")
+        points, geometry = xml_points(obj, path)
+        audit["source_by_format"][geometry] += 1
         idx = class_id(name, path)
-        points = xml_points(obj, path)
-        if cv2.contourArea(cv2.convexHull(points)) <= 1:
-            raise ValueError(f"Degenerate OBB in {path}")
+        example = {"xml": str(path), "object_index": object_index, "raw_name": name}
+        if idx is None:
+            audit["skipped_unresolved_names"][name] += 1
+            audit["examples"].setdefault("unresolved_class", example)
+            continue
+        category = CLASSES[idx]
+        audit["source_by_class_and_format"][category][geometry] += 1
+        if name != category:
+            audit["corrected_class_names"][name] += 1
+            if name in ("feright", "truvk"):
+                audit["examples"].setdefault(name, example)
+        if geometry == "point":
+            audit["skipped_by_class_and_reason"][category]["point_only"] += 1
+            audit["examples"].setdefault("point_only", example)
+            continue
+        if geometry == "hbb":
+            audit["examples"].setdefault("hbb", example)
+        invalid_hbb = geometry == "hbb" and (
+            points[1, 0] - points[0, 0] <= 1 or points[3, 1] - points[0, 1] <= 1
+        )
+        if invalid_hbb or cv2.contourArea(cv2.convexHull(points)) <= 1:
+            audit["skipped_by_class_and_reason"][category]["degenerate"] += 1
+            audit["examples"].setdefault("degenerate", example)
+            continue
+        width, height = OUTPUT_SIZE
+        shifted = points - np.array([BORDER, BORDER], dtype=np.float32)
+        if ((shifted[:, 0] < 0) | (shifted[:, 0] > width) |
+                (shifted[:, 1] < 0) | (shifted[:, 1] > height)).any():
+            audit["examples"].setdefault("crop_boundary", example)
         obb = clipped_obb(points)
         if obb is None:
-            outside += 1
+            audit["skipped_by_class_and_reason"][category]["outside_crop"] += 1
             continue
         coords = " ".join(f"{float(v):.8f}" for v in obb.reshape(-1))
         lines.append(f"{idx} {coords}")
-        counts[CLASSES[idx]] += 1
-    return lines, counts, outside
+        audit["retained_by_class"][category] += 1
+        audit["retained_by_class_and_format"][category][geometry] += 1
+    return lines, audit
 
 
 def draw_preview(image_path: Path, label_path: Path, destination: Path) -> None:
@@ -185,13 +254,12 @@ def prepare(source: Path, out: Path, *, expected_counts: dict[str, int] | None =
             label_out = stage / "labels" / split
             image_out.mkdir(parents=True)
             label_out.mkdir(parents=True)
-            split_counts: Counter = Counter()
-            outside_total = 0
-            for stem, image_path in sorted(images.items()):
+            split_audit = empty_audit()
+            for image_index, (stem, image_path) in enumerate(sorted(images.items()), 1):
                 image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
                 if image is None or (image.shape[1], image.shape[0]) != SOURCE_SIZE:
                     raise ValueError(f"Unreadable or wrong-size RGB image: {image_path}")
-                lines, counts, outside = convert_xml(labels[stem])
+                lines, image_audit = convert_xml(labels[stem])
                 cropped = image[BORDER:-BORDER, BORDER:-BORDER]
                 output_image = image_out / f"{stem}.png"
                 if not cv2.imwrite(str(output_image), cropped):
@@ -199,13 +267,28 @@ def prepare(source: Path, out: Path, *, expected_counts: dict[str, int] | None =
                 (label_out / f"{stem}.txt").write_text(
                     "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8"
                 )
-                split_counts.update(counts)
-                outside_total += outside
+                merge_audit(split_audit, image_audit)
                 if lines:
                     preview_candidates.append((split, stem))
-            summary["splits"][split] = {"images": len(images),
-                                        "objects_by_class": dict(split_counts),
-                                        "objects_outside_crop": outside_total}
+                if image_index % 1000 == 0 or image_index == len(images):
+                    print(f"{split}: {image_index}/{len(images)} RGB images converted", flush=True)
+            summary["splits"][split] = {
+                "images": len(images),
+                "objects_by_class": dict(split_audit["retained_by_class"]),
+                "source_by_format": dict(split_audit["source_by_format"]),
+                "source_by_class_and_format": {
+                    name: dict(split_audit["source_by_class_and_format"][name]) for name in CLASSES
+                },
+                "retained_by_class_and_format": {
+                    name: dict(split_audit["retained_by_class_and_format"][name]) for name in CLASSES
+                },
+                "skipped_by_class_and_reason": {
+                    name: dict(split_audit["skipped_by_class_and_reason"][name]) for name in CLASSES
+                },
+                "corrected_class_names": dict(split_audit["corrected_class_names"]),
+                "skipped_unresolved_names": dict(split_audit["skipped_unresolved_names"]),
+                "examples": split_audit["examples"],
+            }
 
         if len(preview_candidates) < preview_count:
             raise ValueError(f"Only {len(preview_candidates)} labeled images; need {preview_count} previews")
